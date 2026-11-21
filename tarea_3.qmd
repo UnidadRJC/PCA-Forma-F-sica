@@ -1,0 +1,568 @@
+---
+title: "Tarea 3 – Índice de forma física con PCA"
+subtitle: "Introducción al Sports Analytics"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: show
+    embed-resources: true
+    df-print: kable
+execute:
+  warning: false
+  message: false
+lang: es
+---
+
+```{r}
+#| label: setup
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(ggrepel)   # install.packages(c("readxl","dplyr","tidyr","ggplot2","knitr","ggrepel","scales"))
+
+theme_set(theme_minimal(base_size = 12))
+
+colores_grupo <- c("24 o menos" = "#E66101", "Más de 24" = "#5E3C99")
+```
+
+# 1. Exploración de los datos
+
+## 1.1 Carga del archivo
+
+```{r}
+datos <- read_excel("datos_fisicos_anonimizados_promedio.xlsx")
+dim(datos)
+head(datos)
+```
+
+El archivo contiene una fila por jugador (datos ya promediados) con sus métricas físicas
+normalizadas a 90 minutos (P90), la velocidad máxima (PSV-99) y el número de partidos
+válidos (`Count Performances (PQC passed)`).
+
+## 1.2 Tipos de variables y valores faltantes
+
+```{r}
+glimpse(datos)
+```
+
+```{r}
+faltantes <- data.frame(
+  variable  = names(datos),
+  tipo      = sapply(datos, function(x) class(x)[1]),
+  n_NA      = colSums(is.na(datos)),
+  row.names = NULL
+)
+faltantes
+sum(is.na(datos))           # total de NA
+sum(duplicated(datos$`Player ID`))  # jugadores duplicados
+```
+
+Todas las variables son numéricas excepto `Player` (texto). **No hay valores faltantes**
+ni jugadores duplicados. `Birthdate` solo contiene el año de nacimiento.
+
+```{r}
+summary(datos)
+```
+
+## 1.3 Filtro: jugadores con al menos 5 registros
+
+```{r}
+datos_f <- datos %>%
+  filter(`Count Performances (PQC passed)` >= 5)
+
+cat("Jugadores antes del filtro:", nrow(datos), "\n")
+cat("Jugadores con Performance >= 5:", nrow(datos_f), "\n")
+```
+
+Con menos de 5 partidos los promedios son poco fiables (muy sensibles a un solo partido
+atípico), por eso se descartan.
+
+# 2. Preprocesamiento y agregación
+
+## 2.1 Edad y grupos de edad
+
+El archivo solo trae el año de nacimiento, así que la edad se calcula respecto a un año de
+referencia (temporada 2025; cámbialo si los datos son de otra temporada). Se forman dos
+grupos: **24 años o menos** y **más de 24**.
+
+```{r}
+anio_ref <- 2025
+
+datos_f <- datos_f %>%
+  mutate(
+    Edad       = anio_ref - Birthdate,
+    Grupo_edad = factor(ifelse(Edad <= 24, "24 o menos", "Más de 24"),
+                        levels = c("24 o menos", "Más de 24"))
+  )
+
+grupos <- levels(datos_f$Grupo_edad)
+table(datos_f$Grupo_edad)
+```
+
+## 2.2 Selección de métricas
+
+```{r}
+#| label: fig-correlaciones
+#| fig-cap: "Correlación entre todas las métricas físicas"
+#| fig-height: 8
+#| fig-width: 9
+todas <- c("Distance P90", "M/min", "Running Distance P90", "HSR Distance P90",
+           "Sprinting Distance P90", "HI Distance P90", "Count HSR P90",
+           "Count Sprint P90", "Count HI P90", "Count Medium Acceleration P90",
+           "Count High Acceleration P90", "Count Medium Deceleration P90",
+           "Count High Deceleration P90", "PSV-99", "Top 5 PSV-99")
+
+cor_m <- cor(datos_f[todas])
+as.data.frame(as.table(cor_m)) %>%
+  ggplot(aes(Var1, Var2, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", Freq)), size = 2.4) +
+  scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC",
+                       limits = c(-1, 1), name = "r") +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cor(datos_f$`Distance P90`, datos_f$`M/min`)
+cor(datos_f$`Top 5 PSV-99`, datos_f$`Count Performances (PQC passed)`)
+
+# Las métricas HI son la suma de HSR + Sprint (diferencias solo por redondeo)
+summary(datos_f$`Count HI P90`   - (datos_f$`Count HSR P90`    + datos_f$`Count Sprint P90`))
+summary(datos_f$`HI Distance P90` - (datos_f$`HSR Distance P90` + datos_f$`Sprinting Distance P90`))
+```
+
+Se excluyen cuatro métricas antes del PCA:
+
+- **`Distance P90`**: es la misma información que `M/min` (correlación = 1; una es la otra
+  × 90). Incluir ambas duplicaría su peso.
+- **`Count HI P90`** y **`HI Distance P90`**: son combinaciones lineales exactas de otras
+  variables (HI = HSR + Sprint). No aportan información nueva y, si se incluyen, la
+  alta intensidad se cuenta dos veces: el PCA le da más peso del que le corresponde y la
+  matriz de correlaciones queda singular (aparecen componentes con varianza ≈ 0). Se
+  conservan los componentes (HSR y Sprint) y no el total, porque así se mantiene la
+  distinción entre carrera a alta velocidad y sprint, que sumándolas se pierde.
+- **`Top 5 PSV-99`**: la media de los 5 mejores partidos depende del número de partidos
+  jugados (correlación ≈ 0.4 con `Count Performances`), así que favorece a quien más juega.
+  Se usa `PSV-99` en su lugar.
+
+Tampoco entran `Minutes Played per match`, `Player ID`, `Birthdate` ni
+`Count Performances`, que no son métricas de rendimiento físico.
+
+```{r}
+metricas <- c("M/min", "Running Distance P90", "HSR Distance P90",
+              "Sprinting Distance P90", "Count HSR P90",
+              "Count Sprint P90", "Count Medium Acceleration P90",
+              "Count High Acceleration P90", "Count Medium Deceleration P90",
+              "Count High Deceleration P90", "PSV-99")
+length(metricas)
+```
+
+## 2.3 Normalización (z-score) dentro de cada grupo de edad
+
+$$z_{ig} = \frac{x_{ig} - \bar{x}_g}{s_g}$$
+
+Cada jugador se estandariza con la media ($\bar{x}_g$) y la desviación estándar ($s_g$)
+**de su propio grupo de edad**. Así, un z = 1 significa "una desviación por encima de los
+jugadores de su edad", y el perfil físico de un grupo no condiciona la escala del otro.
+
+```{r}
+datos_z <- datos_f %>%
+  group_by(Grupo_edad) %>%
+  mutate(across(all_of(metricas), ~ as.numeric(scale(.x)))) %>%
+  ungroup()
+
+# Comprobación: media 0 y desviación 1 dentro de cada grupo
+datos_z %>%
+  pivot_longer(all_of(metricas), names_to = "Metrica", values_to = "z") %>%
+  group_by(Grupo_edad, Metrica) %>%
+  summarise(media = round(mean(z), 3), sd = round(sd(z), 3), .groups = "drop") %>%
+  pivot_wider(names_from = Grupo_edad, values_from = c(media, sd))
+```
+
+## 2.4 Métricas resumen por grupo de edad
+
+Medias y desviaciones estándar en las unidades originales:
+
+```{r}
+resumen_edad <- datos_f %>%
+  pivot_longer(all_of(metricas), names_to = "Metrica", values_to = "valor") %>%
+  group_by(Metrica, Grupo_edad) %>%
+  summarise(media = mean(valor), sd = sd(valor), .groups = "drop") %>%
+  mutate(texto = sprintf("%.1f ± %.1f", media, sd)) %>%
+  select(Metrica, Grupo_edad, texto) %>%
+  pivot_wider(names_from = Grupo_edad, values_from = texto) %>%
+  mutate(Metrica = factor(Metrica, levels = metricas)) %>%
+  arrange(Metrica)
+
+kable(resumen_edad, caption = "Media ± desviación estándar por grupo de edad")
+```
+
+Para comparar los dos grupos **entre sí** no sirve el z-score por grupo (por construcción,
+la media de cada grupo es 0). Para este gráfico se usa el z-score respecto a toda la
+muestra:
+
+```{r}
+#| label: fig-zscore-edad
+#| fig-cap: "Media de cada métrica por grupo de edad (z-score respecto a toda la muestra)"
+#| fig-height: 6
+resumen_z <- datos_f %>%
+  mutate(across(all_of(metricas), ~ as.numeric(scale(.x)))) %>%
+  pivot_longer(all_of(metricas), names_to = "Metrica", values_to = "z") %>%
+  group_by(Metrica, Grupo_edad) %>%
+  summarise(media_z = mean(z), sd_z = sd(z), .groups = "drop")
+
+ggplot(resumen_z, aes(x = media_z, y = factor(Metrica, levels = rev(metricas)),
+                      color = Grupo_edad)) +
+  geom_vline(xintercept = 0, color = "grey60") +
+  geom_point(size = 3) +
+  scale_color_manual(values = colores_grupo) +
+  labs(x = "Media del z-score (muestra completa)", y = NULL, color = NULL) +
+  theme(legend.position = "top")
+```
+
+Los jugadores de 24 años o menos están por encima de la media en todas las métricas, con
+diferencias pequeñas (del orden de 0.1–0.3 desviaciones estándar). El grupo joven es
+bastante más reducido (`r sum(datos_f$Grupo_edad == "24 o menos")` jugadores frente a
+`r sum(datos_f$Grupo_edad == "Más de 24")`).
+
+# 3. Machine Learning: PCA por grupo de edad
+
+## 3.1 Ajuste de los modelos
+
+Se ajusta un PCA independiente para cada grupo, sobre las métricas estandarizadas dentro
+del grupo (`scale. = TRUE` dentro de cada subconjunto equivale exactamente al z-score del
+apartado 2.3).
+
+El signo de una componente es arbitrario, así que se orienta la PC1 para que valores altos
+signifiquen más rendimiento físico, y la PC2 para que `M/min` cargue en positivo en ambos
+grupos (así los dos modelos se pueden comparar).
+
+```{r}
+ajustar_pca <- function(df) {
+  pca <- prcomp(df[metricas], center = TRUE, scale. = TRUE)
+  if (sum(pca$rotation[, 1]) < 0) {
+    pca$rotation[, 1] <- -pca$rotation[, 1]
+    pca$x[, 1]        <- -pca$x[, 1]
+  }
+  if (pca$rotation["M/min", 2] < 0) {
+    pca$rotation[, 2] <- -pca$rotation[, 2]
+    pca$x[, 2]        <- -pca$x[, 2]
+  }
+  pca
+}
+
+datos_grupo <- split(datos_f, datos_f$Grupo_edad)
+pcas        <- lapply(datos_grupo, ajustar_pca)
+
+summary(pcas[["24 o menos"]])
+summary(pcas[["Más de 24"]])
+```
+
+```{r}
+#| label: fig-scree
+#| fig-cap: "Varianza explicada por cada componente, por grupo de edad"
+#| fig-width: 9
+var_exp <- bind_rows(lapply(grupos, function(g) {
+  v <- pcas[[g]]$sdev^2
+  data.frame(Grupo_edad = g,
+             PC  = factor(paste0("PC", seq_along(v)), levels = paste0("PC", seq_along(v))),
+             var = v / sum(v))
+})) %>% mutate(Grupo_edad = factor(Grupo_edad, levels = grupos))
+
+ve <- function(g, k) scales::percent(var_exp$var[var_exp$Grupo_edad == g][k], 0.1)
+
+ggplot(var_exp, aes(PC, var, fill = Grupo_edad)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  scale_fill_manual(values = colores_grupo) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Varianza explicada", fill = NULL) +
+  theme(legend.position = "top")
+
+var_exp %>%
+  filter(PC %in% c("PC1", "PC2", "PC3")) %>%
+  mutate(var = scales::percent(var, 0.1)) %>%
+  pivot_wider(names_from = PC, values_from = var)
+```
+
+- **24 o menos**: la PC1 explica `r ve("24 o menos", 1)` y la PC2 `r ve("24 o menos", 2)`.
+- **Más de 24**: la PC1 explica `r ve("Más de 24", 1)` y la PC2 `r ve("Más de 24", 2)`.
+
+En el grupo joven las dos primeras componentes tienen un peso muy parecido, así que la
+PC1 resume peor el rendimiento físico que en el grupo de más edad.
+
+## 3.2 PC1 como índice de forma física
+
+La PC1 de cada grupo se escala a 0–100 **dentro de su grupo** (0 = peor del grupo,
+100 = mejor del grupo).
+
+```{r}
+resultados <- bind_rows(lapply(grupos, function(g) {
+  df <- datos_grupo[[g]]
+  df$PC1    <- pcas[[g]]$x[, 1]
+  df$Indice <- 100 * (df$PC1 - min(df$PC1)) / (max(df$PC1) - min(df$PC1))
+  df
+}))
+
+resultados %>%
+  group_by(Grupo_edad) %>%
+  summarise(n = n(), min = min(Indice), mediana = median(Indice),
+            media = mean(Indice), max = max(Indice))
+```
+
+## 3.3 Ranking de jugadores por grupo
+
+```{r}
+ranking <- resultados %>%
+  group_by(Grupo_edad) %>%
+  arrange(desc(Indice), .by_group = TRUE) %>%
+  mutate(Rank = row_number()) %>%
+  ungroup() %>%
+  select(Grupo_edad, Rank, Player, Edad,
+         Partidos = `Count Performances (PQC passed)`,
+         Indice, `HSR Distance P90`, `Sprinting Distance P90`, `PSV-99`)
+
+ranking %>%
+  filter(Grupo_edad == "24 o menos") %>%
+  head(10) %>%
+  select(-Grupo_edad) %>%
+  mutate(Indice = round(Indice, 1)) %>%
+  kable(caption = "Top 10 – jugadores de 24 años o menos")
+
+ranking %>%
+  filter(Grupo_edad == "Más de 24") %>%
+  head(20) %>%
+  select(-Grupo_edad) %>%
+  mutate(Indice = round(Indice, 1)) %>%
+  kable(caption = "Top 20 – jugadores de más de 24 años")
+```
+
+```{r}
+# Guardar el ranking completo (ambos grupos)
+write.csv(ranking, "ranking_forma_fisica.csv", row.names = FALSE)
+```
+
+## 3.4 Comprobación: ¿qué pasa si se incluyen las métricas HI?
+
+Si en cada grupo se repite el PCA añadiendo `Count HI P90` y `HI Distance P90`, aparecen
+componentes con varianza prácticamente nula (señal de dependencia lineal exacta), y el
+ranking apenas cambia:
+
+```{r}
+bind_rows(lapply(grupos, function(g) {
+  df <- datos_grupo[[g]]
+  p  <- prcomp(df[c(metricas, "Count HI P90", "HI Distance P90")],
+               center = TRUE, scale. = TRUE)
+  pc <- p$x[, 1]
+  if (cor(pc, pcas[[g]]$x[, 1]) < 0) pc <- -pc
+  data.frame(Grupo_edad = g,
+             autovalores_ultimas_PC = paste(round(tail(p$sdev^2, 2), 4), collapse = " / "),
+             spearman_ranking = round(cor(pcas[[g]]$x[, 1], pc, method = "spearman"), 3))
+}))
+```
+
+El orden de los jugadores casi no varía, pero el modelo sin las métricas HI es el correcto:
+no cuenta dos veces la alta intensidad y las cargas se pueden interpretar.
+
+## 3.5 ¿Aporta algo separar por edad?
+
+Se compara con un PCA único sobre todos los jugadores: para cada grupo, cuánto se parece
+el ranking por grupo al que saldría con el modelo conjunto.
+
+```{r}
+pca_global <- ajustar_pca(datos_f)
+datos_f$PC1_global <- pca_global$x[, 1]
+
+comparacion <- resultados %>%
+  left_join(select(datos_f, Player, PC1_global), by = "Player")
+
+comparacion %>%
+  group_by(Grupo_edad) %>%
+  summarise(
+    spearman_vs_global = round(cor(PC1, PC1_global, method = "spearman"), 3),
+    top10_coincidentes = length(intersect(Player[order(-PC1)][1:10],
+                                          Player[order(-PC1_global)][1:10]))
+  )
+```
+
+En el grupo de más de 24 el ranking es prácticamente el mismo que con el modelo conjunto
+(este grupo es el 80 % de la muestra y domina el PCA global). En el grupo joven el orden
+cambia más (correlación de Spearman ≈ 0.93), aunque los mejores siguen siendo casi los
+mismos: su PC1 pondera las métricas de forma distinta (ver apartado 4.2), lo que reordena
+sobre todo la zona media del ranking.
+
+# 4. Visualización y conclusiones
+
+## 4.1 Jugadores mejor valorados
+
+```{r}
+grafico_top <- function(g, n) {
+  ranking %>%
+    filter(Grupo_edad == g) %>%
+    head(n) %>%
+    ggplot(aes(x = Indice, y = reorder(Player, Indice))) +
+    geom_col(fill = colores_grupo[[g]], width = 0.7) +
+    geom_text(aes(label = sprintf("%.1f", Indice)), hjust = -0.15, size = 3.2) +
+    scale_x_continuous(limits = c(0, 108), expand = c(0, 0)) +
+    labs(x = "Índice de forma física (0–100, dentro del grupo)", y = NULL) +
+    theme(panel.grid.major.y = element_blank())
+}
+```
+
+```{r}
+#| label: fig-top-jovenes
+#| fig-cap: "Top 10 jugadores de 24 años o menos (PC1 del grupo, escalado 0–100)"
+#| fig-height: 4.5
+grafico_top("24 o menos", 10)
+```
+
+```{r}
+#| label: fig-top-mayores
+#| fig-cap: "Top 20 jugadores de más de 24 años (PC1 del grupo, escalado 0–100)"
+#| fig-height: 7
+grafico_top("Más de 24", 20)
+```
+
+> Los índices **no son comparables entre grupos**: un 80 en el grupo joven y un 80 en el
+> de más edad significan "cerca del mejor de su grupo", pero cada uno con su propia escala
+> y su propia combinación de métricas.
+
+## 4.2 ¿Qué métricas contribuyen más?
+
+La contribución de cada métrica a la PC1 es su carga al cuadrado (las cargas al cuadrado
+suman 1, así que se expresa en %).
+
+```{r}
+#| label: fig-contribuciones
+#| fig-cap: "Contribución de cada métrica a la PC1, por grupo de edad"
+#| fig-height: 6
+cargas_df <- bind_rows(lapply(grupos, function(g) {
+  data.frame(Grupo_edad = g,
+             Metrica    = metricas,
+             Carga_PC1  = pcas[[g]]$rotation[metricas, 1],
+             Carga_PC2  = pcas[[g]]$rotation[metricas, 2],
+             row.names  = NULL)
+})) %>%
+  mutate(Contrib_PC1 = 100 * Carga_PC1^2,
+         Grupo_edad  = factor(Grupo_edad, levels = grupos))
+
+cargas_df %>%
+  select(Metrica, Grupo_edad, Contrib_PC1) %>%
+  mutate(Contrib_PC1 = round(Contrib_PC1, 1)) %>%
+  pivot_wider(names_from = Grupo_edad, values_from = Contrib_PC1) %>%
+  arrange(desc(`Más de 24`))
+
+orden <- cargas_df %>%
+  filter(Grupo_edad == "Más de 24") %>%
+  arrange(Contrib_PC1) %>%
+  pull(Metrica)
+
+ggplot(cargas_df, aes(x = Contrib_PC1, y = factor(Metrica, levels = orden),
+                      fill = Grupo_edad)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_vline(xintercept = 100 / length(metricas), linetype = "dashed", color = "grey40") +
+  scale_fill_manual(values = colores_grupo) +
+  labs(x = "Contribución a la PC1 (%)", y = NULL, fill = NULL,
+       caption = "Línea discontinua: contribución si todas pesaran igual") +
+  theme(legend.position = "top", panel.grid.major.y = element_blank())
+```
+
+```{r}
+#| label: fig-biplot
+#| fig-cap: "Cargas de las métricas en PC1 y PC2, por grupo de edad"
+#| fig-height: 6
+#| fig-width: 11
+ggplot(cargas_df, aes(Carga_PC1, Carga_PC2)) +
+  geom_hline(yintercept = 0, color = "grey70") +
+  geom_vline(xintercept = 0, color = "grey70") +
+  geom_segment(aes(x = 0, y = 0, xend = Carga_PC1, yend = Carga_PC2, color = Grupo_edad),
+               arrow = arrow(length = unit(0.2, "cm"))) +
+  geom_text_repel(aes(label = Metrica), size = 2.7, min.segment.length = 0,
+                  box.padding = 0.35, seed = 1) +
+  facet_wrap(~ Grupo_edad) +
+  scale_color_manual(values = colores_grupo, guide = "none") +
+  coord_cartesian(xlim = c(-0.1, 0.5), ylim = c(-0.55, 0.55)) +
+  labs(x = "Carga en PC1 (índice de forma)", y = "Carga en PC2")
+```
+
+**Interpretación.**
+
+- **Más de 24.** Todas las métricas cargan en positivo en la PC1, así que es un **factor
+  general de rendimiento físico**. Las que más pesan son las de carrera a alta velocidad
+  (`Count HSR P90` y `HSR Distance P90`, ≈ 15 % cada una), seguidas de sprints y
+  deceleraciones altas (≈ 11 %). El volumen (`M/min`, `Running Distance`, ≈ 5 %) y la
+  velocidad máxima (`PSV-99`, ≈ 2 %) aportan poco.
+- **24 o menos.** La PC1 es un **factor de intensidad**: la dominan los sprints, las
+  deceleraciones y aceleraciones altas y el HSR (≈ 13–16 % cada una), y la velocidad
+  máxima pesa más que en los mayores (≈ 8 %). En cambio, el volumen (`M/min`,
+  `Running Distance`) y las aceleraciones/deceleraciones medias **prácticamente no
+  contribuyen** (< 3 %): en este grupo el volumen va por su cuenta en la PC2.
+- **PC2 en ambos grupos.** Separa el perfil de **volumen/resistencia** (distancia,
+  running, acciones medias; carga positiva) del de **velocidad/explosividad** (PSV-99,
+  sprints, aceleraciones altas; carga negativa). En el grupo joven esta segunda
+  dimensión es casi tan importante como la primera (`r ve("24 o menos", 2)` frente a
+  `r ve("24 o menos", 1)`).
+- **Conclusión.** Separar por edad sí cambia lo que mide el índice: en los mayores premia
+  un rendimiento físico global; en los jóvenes premia sobre todo la intensidad y no tiene
+  en cuenta cuánto corren. Aun así, los jugadores más destacados de cada grupo apenas
+  cambian respecto al modelo conjunto (apartado 3.5): las diferencias están más en la
+  interpretación del índice que en quiénes son los mejores.
+
+## 4.3 Limitaciones y posibles mejoras
+
+**Limitaciones**
+
+1. **Índices no comparables entre grupos**. Cada grupo tiene su propia normalización, sus
+   propias cargas y su propia escala 0–100. No se puede decir que un joven con 80 está
+   "mejor" que un veterano con 70. Para comparar entre grupos habría que usar el modelo
+   conjunto.
+2. **Tamaño del grupo joven**. Con `r sum(datos_f$Grupo_edad == "24 o menos")` jugadores y
+   `r length(metricas)` variables, las cargas del PCA del grupo joven son menos estables:
+   unos pocos jugadores pueden cambiarlas bastante.
+3. **Corte de edad arbitrario y edad aproximada**. Solo se dispone del año de nacimiento y
+   el corte en 24 años es una decisión del análisis; otro corte (o el año de referencia)
+   cambiaría la composición de los grupos.
+4. **Sin posición**. Las demandas físicas dependen mucho de la posición (un lateral o un
+   mediocentro recorre más que un central). El índice premia a las posiciones más
+   exigentes, no necesariamente al jugador en mejor forma.
+5. **Sesgo de minutos en las métricas P90**. El índice está correlacionado negativamente
+   con los minutos por partido en ambos grupos:
+
+   ```{r}
+   resultados %>%
+     group_by(Grupo_edad) %>%
+     summarise(cor_indice_minutos = round(cor(Indice, `Minutes Played per match`), 2))
+   ```
+
+   Quien juega menos minutos (suplentes, sustituidos) llega más fresco y su ritmo,
+   extrapolado a 90', se infla.
+6. **La PC1 deja fuera mucha información**: solo recoge `r ve("Más de 24", 1)` (más de 24)
+   y `r ve("24 o menos", 1)` (24 o menos) de la varianza. La PC2, que distingue volumen de
+   velocidad, queda fuera del índice.
+7. **El índice es relativo**. El escalado 0–100 depende del mínimo y el máximo de cada
+   grupo: un solo jugador extremo cambia la escala de todos, y no se puede comparar entre
+   temporadas o ligas.
+8. **Datos agregados**. Son promedios por jugador: no hay evolución en el tiempo (la
+   "forma" es algo que cambia), ni contexto de partido (resultado, rival, estilo de juego).
+9. **PCA es lineal y no supervisado**: maximiza varianza, no rendimiento. Que una métrica
+   pese mucho en la PC1 no significa que sea la más importante para ganar partidos.
+
+**Posibles mejoras**
+
+- Calcular el índice **dentro de cada posición** (o posición × edad, si hay datos
+  suficientes) y añadir contexto de equipo/rival.
+- Para comparar entre grupos de edad, usar un **modelo común** (mismas cargas) y
+  estandarizar solo la puntuación final por grupo, o comprobar la estabilidad de las cargas
+  del grupo joven con *bootstrap*.
+- Ajustar por minutos: filtrar por un mínimo de minutos por partido o usar un modelo que
+  corrija ese efecto.
+- Usar **varias componentes** (p. ej. un índice de volumen y otro de intensidad, o
+  ponderar PC1 y PC2 por su varianza explicada) en vez de solo la PC1, sobre todo en el
+  grupo joven.
+- Escalar con percentiles o z-scores de PC1 en lugar de min–max, para que sea robusto a
+  valores extremos.
+- Usar datos partido a partido para medir la **evolución de la forma** (tendencias, medias
+  móviles) y la consistencia del jugador.
+- Validar el índice frente a una variable externa (minutos, valoraciones, resultados) o
+  probar otros métodos (análisis factorial, clustering de perfiles físicos).
